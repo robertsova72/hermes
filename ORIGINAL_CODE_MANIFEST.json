@@ -1,0 +1,77 @@
+[
+  {
+    "file": "djk.py",
+    "sha256": "796b42e54a9897124980a6b6572d7281b2758ea78ad110a41fdc79fec4b3bd99",
+    "bytes": 198
+  },
+  {
+    "file": "estimateurs.py",
+    "sha256": "c245b5f5913c5717da97af34afb8e6c19441b10a537aaa84f702ea1055f08c7e",
+    "bytes": 16619
+  },
+  {
+    "file": "farimaexact.py",
+    "sha256": "666774581537ac88c696e34a141bedfc847c2c430e902978e2c2605d8cf0b3e7",
+    "bytes": 13765
+  },
+  {
+    "file": "genproductscaling.py",
+    "sha256": "ad439b19dd3689b01fb656ce711a208a764e564808952f390fbf4eb7cef0320f",
+    "bytes": 3567
+  },
+  {
+    "file": "main.py",
+    "sha256": "dae01896f7c585d02dc9d95ced2a6342c29eabcca4645333664265c1b7348e26",
+    "bytes": 6373
+  },
+  {
+    "file": "plotconfigurations.py",
+    "sha256": "292767314861a4c5b522683c0c6d2511d4f0218474685aa540f77c97ac9829c8",
+    "bytes": 8562
+  },
+  {
+    "file": "productscaling.py",
+    "sha256": "f63c623c4c1bf17ccbb72cfb25a541a8424c148c18f17146be173e707cd94d8d",
+    "bytes": 6050
+  },
+  {
+    "file": "quadestim.py",
+    "sha256": "039df8be7d76a4f6e509f95c29aabb699ade3ec6da7d8ac8f3bae3083877160f",
+    "bytes": 6108
+  },
+  {
+    "file": "saveconfigurations.py",
+    "sha256": "f893980d54a72f22d2656a9f6d9418eb9570c8c945239dfea6b49176277fef97",
+    "bytes": 4288
+  },
+  {
+    "file": "sigmaJ.py",
+    "sha256": "afca1ac3790c6e6bf7dffcde970254a7e10f2814e5a7af03e8aa01c0938e7bdb",
+    "bytes": 6238
+  },
+  {
+    "file": "simulations.py",
+    "sha256": "18e29d4c2f5927e8a127019e67082b9e8f20e69c36a30ea0a27e77429665b41b",
+    "bytes": 19498
+  },
+  {
+    "file": "stochasticintegration.py",
+    "sha256": "94caea1ebe381c7acf77387f4570d63462874996a4717fcec1c5d7f40931554d",
+    "bytes": 6610
+  },
+  {
+    "file": "testnormalite.py",
+    "sha256": "fc9e0f0fa4a79cf96c668c95a727e524cb2a2daac27c8def7e87db29ef4b5f8e",
+    "bytes": 1065
+  },
+  {
+    "file": "wavestim.py",
+    "sha256": "26182a5d787ead1e1dcf764f9b337f8426f50e98598b060eec6c9088dc060c26",
+    "bytes": 9181
+  },
+  {
+    "file": "zjk.py",
+    "sha256": "460eb0a07b4db2bac2d8f86a3a3bcb66570bf728a72dad7d3fd54a5269edb21b",
+    "bytes": 1324
+  }
+]

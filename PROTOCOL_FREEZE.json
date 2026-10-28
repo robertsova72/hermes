@@ -1,0 +1,15 @@
+{
+  "protocol_id": "HERMES-TRL4-LVP-1.0",
+  "frozen_on": "2026-10-28",
+  "software_version": "0.4.0-dev3",
+  "files": {
+    "LABORATORY_VALIDATION_PROTOCOL_v1.0_FROZEN.md": {
+      "sha256": "c2e51d2373449fc790178bedaafcb89ad29f4a46c914d52a25c5dbec87150bba",
+      "bytes": 9633
+    },
+    "configs/acceptance_criteria.yaml": {
+      "sha256": "5c8c70118441addebe4fd90ce07b6b540a0e35e676b7426fd62299907020ca12",
+      "bytes": 2371
+    }
+  }
+}

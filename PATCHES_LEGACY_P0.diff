@@ -1,0 +1,2090 @@
+--- legacy_original/farimaexact.py	2026-10-28 13:45:14.554717306 +0000
++++ legacy_patched/farimaexact.py	2026-10-28 13:46:15.108642977 +0000
+@@ -1,428 +1,428 @@
+-import numpy as np
+-from scipy.special import gammaln
+-from typing import Optional, Dict, Tuple
+-
+-
+-
+-def _acf_arfima0d0(n, d, unit_var=True):
+-    """
+-    ACF gamma(k), k=0..n, pour ARFIMA(0,d,0), calculée de façon stable via gammaln.
+-    Si unit_var=True, renvoie une ACF *normalisée* telle que gamma(0)=1.
+-    """
+-    k = np.arange(n + 1, dtype=float)
+-    # log C(d) = ln Γ(1-2d) - ln Γ(d) - ln Γ(1-d)
+-    logC = gammaln(1.0 - 2.0*d) - (gammaln(d) + gammaln(1.0 - d))
+-    # ln gamma(k) = logC + ln Γ(k+d) - ln Γ(k+1-d)
+-    log_gk = logC + (gammaln(k + d) - gammaln(k + 1.0 - d))
+-    g = np.exp(log_gk)
+-
+-    if unit_var:
+-        # gamma(0) = Γ(1-2d)/Γ(1-d)^2  =>  log gamma(0) = logC + ln Γ(d) - ln Γ(1-d)
+-        log_g0 = logC + (gammaln(d) - gammaln(1.0 - d))
+-        g = np.exp(log_gk - log_g0)  # divise toute l'ACF par gamma(0)
+-    return g
+-
+-def farima_CME(K, H, max_tries=20, tol=1e-12, rng=None):
+-    """
+-    Génère une fGn (FARIMA(0,d,0) avec d=H-1/2) de longueur K
+-    avec *variance unitaire* au lag 0 (normalisation analytique).
+-    Implémentation CME robuste (Wood–Chan/Davies–Harte).
+-    """
+-    if rng is None:
+-        rng = np.random.default_rng()
+-
+-    d = float(H) - 0.5
+-    if not (-0.5 < d < 0.5):
+-        raise ValueError("H doit être dans (0,1) ⇒ d=H-0.5 dans (-0.5,0.5).")
+-    if K < 1:
+-        return np.zeros(0, dtype=float)
+-
+-    # Taille de l'embedding circulant (>= 2*(K-1))
+-    p = int(np.ceil(np.log2(2 * (K - 1) if K > 1 else 1)))
+-
+-    for _ in range(max_tries):
+-        m = 2**p
+-        n = m // 2
+-
+-        # --- ACF normalisée : gamma(0)=1 ---
+-        g = _acf_arfima0d0(n, d, unit_var=True)
+-
+-        # vecteur circulant z = [g0, g1, ..., g_{n}, g_{n-1}, ..., g1]
+-        z = np.concatenate([g, g[-2:0:-1]])
+-        w = np.fft.fft(z).real / m  # valeurs propres (théoriquement ≥0)
+-
+-        w_max = w.max()
+-        eps = tol * (w_max if w_max > 0 else 1.0)
+-
+-        if w.min() < -eps:
+-            # pas assez grand => on augmente l'embedding
+-            p += 1
+-            continue
+-
+-        # Rogne de minuscules négatifs dus à l'arrondi
+-        w = np.maximum(w, 0.0)
+-
+-        # Bruit gaussien complexe i.i.d. ~ N(0,1) + i N(0,1)
+-        xi = rng.standard_normal(m) + 1j * rng.standard_normal(m)
+-        N = np.sqrt(w) * xi
+-
+-        S = np.fft.fft(N).real  # séquence réelle de covariance z
+-        x = S[:int(K)]
+-
+-        # À ce stade: Var théorique ≈ 1 ; pas de renormalisation empirique
+-        return x
+-
+-    raise RuntimeError("CME n'a pas obtenu un spectre PSD après "
+-                       f"{max_tries} tentatives. Augmentez max_tries ou vérifiez 'tol'.")
+-
+-
+-def _apply_taper(x, taper='welch'):
+-    """
+-    Applique un lissage multiplicatif (taper) pour réduire la fuite spectrale.
+-    - 'welch' : w_t = 1 - ((t - (n-1)/2) / ((n+1)/2))^2
+-    - None    : pas de taper
+-    Retourne x_tapered (centré), et la moyenne soustraite.
+-    """
+-    x = np.asarray(x, dtype=float)
+-    mu = x.mean()
+-    y = x - mu
+-    n = y.size
+-    if taper is None:
+-        return y, mu
+-    if taper == 'welch':
+-        t = np.arange(n)
+-        w = 1.0 - ((t - (n - 1) / 2.0) / ((n + 1) / 2.0))**2
+-        return y * w, mu
+-    else:
+-        raise ValueError("taper inconnu. Utilise 'welch' ou None.")
+-
+-
+-def _periodogram(y):
+-    """
+-    Périodogramme non normalisé (échelle 2π) aux fréquences de Fourier positives.
+-    Retourne (freqs, I) avec freqs = 2π*k/n, k=1..floor(n/2).
+-    """
+-    n = y.size
+-    # FFT non normalisée
+-    Y = np.fft.rfft(y)  # fréquences 0..n/2
+-    # Retirer la fréquence zéro (k=0)
+-    I = (np.abs(Y[1:])**2) / (2.0 * np.pi * n)  # échelle standard en long memory
+-    k = np.arange(1, Y.size)                   # indices 1..n/2
+-    freqs = 2.0 * np.pi * k / n
+-    return freqs, I
+-
+-
+-def estimate_d_local_whittle(x, m=None, taper='welch'):
+-    """
+-    Estimateur local-Whittle de d (Robinson, 1995) pour FARIMA(0,d,0).
+-    Paramètres
+-    ---------
+-    x : array_like
+-        Série temporelle (n échantillons).
+-    m : int or None
+-        Nombre de fréquences basses utilisées (bande passante). Par défaut m = floor(n^0.8).
+-        Doit satisfaire 1 << m << n.
+-    taper : {'welch', None}
+-        Taper pour limiter la fuite spectrale (recommandé 'welch').
+-
+-    Retour
+-    ------
+-    d_hat : float
+-        Estimation de d.
+-    """
+-    x = np.asarray(x, dtype=float)
+-    n = x.size
+-    if n < 64:
+-        raise ValueError("Série trop courte pour l'estimation semi-paramétrique (n >= 64 recommandé).")
+-
+-    y, _ = _apply_taper(x, taper=taper)
+-    w, I = _periodogram(y)  # w in (0, π], I >= 0
+-
+-    # Choix automatique de m si non fourni
+-    if m is None:
+-        m = int(np.floor(n**0.8))
+-    m = max(5, min(m, I.size // 2))  # borne
+-    w_m = w[:m]
+-    I_m = I[:m]
+-
+-    # Fonction objectif Whittle local (profilée en sigma^2)
+-    # Q(d) = log( (1/m) sum_{j=1}^m I(w_j) w_j^{2d} ) - (2d/m) * sum log w_j
+-    logw = np.log(w_m)
+-    Slogw = np.mean(logw)
+-
+-    def Q_of_d(d):
+-        weights = np.exp(2.0 * d * logw)  # w_j^{2d}
+-        S = np.mean(I_m * weights)
+-        if S <= 0 or not np.isfinite(S):
+-            return np.inf
+-        return np.log(S) - 2.0 * d * Slogw
+-
+-    # Recherche 1D sur d dans (-0.49, 0.49)
+-    # Grille initiale puis raffinement par golden-section.
+-    d_lo, d_hi = -0.49, 0.49
+-
+-    # Grille grossière pour point de départ
+-    grid = np.linspace(d_lo, d_hi, 61)
+-    vals = np.array([Q_of_d(d) for d in grid])
+-    j0 = np.nanargmin(vals)
+-    # Encadrer autour du minimum grossier
+-    a = max(d_lo, grid[max(0, j0 - 2)])
+-    b = min(d_hi, grid[min(len(grid) - 1, j0 + 2)])
+-
+-    # Golden section search
+-    phi = (1 + 5**0.5) / 2
+-    invphi = 1 / phi
+-    invphi2 = (1 / phi)**2
+-    c = b - (b - a) * invphi
+-    d = a + (b - a) * invphi
+-    fc = Q_of_d(c)
+-    fd = Q_of_d(d)
+-    for _ in range(80):
+-        if fc > fd:
+-            a = c
+-            c = d
+-            fc = fd
+-            d = a + (b - a) * invphi
+-            fd = Q_of_d(d)
+-        else:
+-            b = d
+-            d = c
+-            fd = fc
+-            c = b - (b - a) * invphi
+-            fc = Q_of_d(c)
+-        if abs(b - a) < 1e-6:
+-            break
+-
+-    d_hat = 0.5 * (a + b)
+-    return float(d_hat)
+-
+-
+-def estimate_d_gph(x, m=None, taper='welch'):
+-    """
+-    Estimateur GPH (Geweke-Porter-Hudak) de d par régression log-périodogramme.
+-    Paramètres
+-    ---------
+-    x : array_like
+-        Série temporelle.
+-    m : int or None
+-        Nombre de fréquences basses à utiliser. Par défaut m = floor(n^0.5).
+-    taper : {'welch', None}
+-        Taper pour limiter la fuite spectrale.
+-
+-    Retour
+-    ------
+-    d_hat : float
+-        Estimation de d.
+-    """
+-    x = np.asarray(x, dtype=float)
+-    n = x.size
+-    if n < 64:
+-        raise ValueError("Série trop courte pour GPH (n >= 64 recommandé).")
+-
+-    y, _ = _apply_taper(x, taper=taper)
+-    w, I = _periodogram(y)
+-
+-    # Choix m : prise classique m ~ n^0.5 (ou n^0.6)
+-    if m is None:
+-        m = int(np.floor(n**0.5))
+-    m = max(5, min(m, I.size // 2))
+-    w_m = w[:m]
+-    I_m = I[:m]
+-
+-    # Régression: log I(w_j) = c - 2d * log(2*sin(w_j/2)) + erreur
+-    z = np.log(2.0 * np.sin(w_m / 2.0))
+-    y_reg = np.log(I_m)
+-
+-    X = np.vstack([np.ones_like(z), -2.0 * z]).T  # colonnes: 1, -2*z
+-    beta, *_ = np.linalg.lstsq(X, y_reg, rcond=None)
+-    # beta = [c_hat, d_hat], mais attention au signe:
+-    # y = c + (-2d) z => coefficient sur z = -2 d => d_hat = -(coef_z)/2
+-    coef_z = beta[1]
+-    d_hat = -coef_z / 2.0
+-    return float(d_hat)
+-
+-
+-def estimate_d(x, method='local_whittle', m=None, taper='welch'):
+-    """
+-    Wrapper générique pour estimer d sur une FARIMA(0,d,0).
+-
+-    method : {'local_whittle', 'gph'}
+-        - 'local_whittle' : robuste, recommandé
+-        - 'gph'          : plus simple/rapide
+-    m : int or None
+-        Bande passante (# fréquences basses). Sinon valeur par défaut raisonnable.
+-    taper : {'welch', None}
+-        Taper pour limiter la fuite spectrale.
+-    """
+-    method = method.lower()
+-    if method == 'local_whittle':
+-        return estimate_d_local_whittle(x, m=m, taper=taper)
+-    elif method == 'gph':
+-        return estimate_d_gph(x, m=m, taper=taper)
+-    else:
+-        raise ValueError("method inconnu. Utilise 'local_whittle' ou 'gph'.")
+-        
+-
+-# -*- coding: utf-8 -*-
+-"""
+-Estimateurs de variance pour une séquence FARIMA(0,d,0)
+-Compatibilité : Python 3.9 (pas de '|' dans les annotations)
+-"""
+-
+-
+-
+-# ----------------------------- Utilitaires ----------------------------- #
+-
+-def _demean(x: np.ndarray) -> np.ndarray:
+-    x = np.asarray(x, dtype=float)
+-    return x - np.mean(x)
+-
+-
+-def _taper_welch(n: int) -> np.ndarray:
+-    """
+-    Fenêtre de Welch (parabole) de longueur n :
+-    w_t = 1 - ((t - (n-1)/2) / ((n+1)/2))^2
+-    """
+-    t = np.arange(n, dtype=float)
+-    return 1.0 - ((t - (n - 1) / 2.0) / ((n + 1) / 2.0)) ** 2
+-
+-
+-# ----------------------- Estimateur de variance ------------------------ #
+-
+-def estimate_variance_farima(
+-    x,
+-    method: str = "unbiased",
+-    centre: bool = True,
+-    taper: Optional[str] = None,
+-) -> float:
+-    """
+-    Estime Var[X_t] (lag 0) à partir d'une réalisation x de FARIMA(0,d,0).
+-
+-    Paramètres
+-    ----------
+-    x : array_like
+-        Réalisation 1D (fGn simulée, par ex. via FARIMA(0,d,0)).
+-    method : {'unbiased','tapered','mad'}
+-        - 'unbiased' : variance empirique centrée (ddof=1 si centre=True, sinon 0).
+-        - 'tapered'  : applique une fenêtre (Welch) puis variance centrée
+-                       avec correction d'énergie ⟨w^2⟩.
+-        - 'mad'      : estimateur robuste via MAD (≈ variance sous gaussien).
+-    centre : bool
+-        Centre la série avant calcul (recommandé).
+-    taper : {None,'welch'}
+-        Taper multiplicatif avant variance (utile si method='tapered').
+-
+-    Retour
+-    ------
+-    var_hat : float
+-        Estimation de la variance (lag 0).
+-    """
+-    x = np.asarray(x, dtype=float)
+-    n = x.size
+-    if n < 2:
+-        raise ValueError("Il faut au moins 2 observations pour estimer la variance.")
+-
+-    if method not in {"unbiased", "tapered", "mad"}:
+-        raise ValueError("method doit être 'unbiased', 'tapered' ou 'mad'.")
+-
+-    if method == "mad":
+-        # Estimateur robuste : Var ≈ (MAD / Φ^{-1}(0.75))^2
+-        med = np.median(x)
+-        mad = np.median(np.abs(x - med))
+-        # Φ^{-1}(0.75) ≈ 0.67448975
+-        sigma = mad / 0.6744897501960817
+-        return float(sigma * sigma)
+-
+-    # Méthodes basées sur la variance empirique
+-    y = x.copy()
+-
+-    if taper is not None:
+-        if taper.lower() == "welch":
+-            w = _taper_welch(n)
+-            y = y * w
+-        else:
+-            raise ValueError("taper inconnu. Utilise None ou 'welch'.")
+-
+-        # Après taper, on recalcule le centrage si demandé
+-        if centre:
+-            y = y - np.mean(y)
+-
+-        # Correction d'énergie moyenne du taper pour ne pas biaiser la variance
+-        w2_mean = np.mean(w ** 2)
+-        ddof = 1 if centre else 0
+-        var_raw = np.var(y, ddof=ddof)
+-        return float(var_raw / (w2_mean if w2_mean > 0 else 1.0))
+-
+-    # Sans taper
+-    if centre:
+-        return float(np.var(y, ddof=1))
+-    else:
+-        return float(np.var(y, ddof=0))
+-
+-
+-# ----------------- IC via bootstrap en blocs (optionnel) ---------------- #
+-
+-def variance_ci_block_bootstrap(
+-    x,
+-    B: int = 500,
+-    block_len: Optional[int] = None,
+-    alpha: float = 0.05,
+-    estimator_kwargs: Optional[Dict] = None,
+-    rng: Optional[np.random.Generator] = None,
+-) -> Tuple[float, Tuple[float, float]]:
+-    """
+-    Intervalle de confiance (IC) pour Var[X_t] via bootstrap en blocs (simple).
+-    Utile avec dépendance (FARIMA).
+-
+-    Paramètres
+-    ----------
+-    x : array_like
+-        Réalisation 1D.
+-    B : int
+-        Nombre de rééchantillonnages bootstrap.
+-    block_len : int | None
+-        Longueur de bloc (par défaut ~ n^{1/3}).
+-    alpha : float
+-        Niveau (0.05 => IC à 95%).
+-    estimator_kwargs : dict | None
+-        Arguments passés à estimate_variance_farima (ex: {'method':'tapered','taper':'welch'}).
+-    rng : np.random.Generator | None
+-        Générateur aléatoire pour reproductibilité.
+-
+-    Retour
+-    ------
+-    (var_hat, (lo, hi))
+-        var_hat : estimateur sur x,
+-        (lo, hi) : bornes de l'IC par percentiles.
+-    """
+-    x = np.asarray(x, dtype=float)
+-    n = x.size
+-    if n < 10:
+-        raise ValueError("Série trop courte pour bootstrap (n >= 10).")
+-
+-    if rng is None:
+-        rng = np.random.default_rng(1234)
+-    if estimator_kwargs is None:
+-        estimator_kwargs = {}
+-
+-    # Estimation sur l'échantillon d'origine
+-    var_hat = estimate_variance_farima(x, **estimator_kwargs)
+-
+-    # Taille des blocs
+-    if block_len is None:
+-        block_len = max(5, int(round(n ** (1.0 / 3.0))))
+-    block_len = int(block_len)
+-    n_blocks = int(np.ceil(n / block_len))
+-
+-    vals = []
+-    for _ in range(B):
+-        # indices de départ aléatoires pour blocs non chevauchants
+-        starts = rng.integers(0, max(1, n - block_len + 1), size=n_blocks)
+-        pieces = [x[s: s + block_len] for s in starts]
+-        xb = np.concatenate(pieces)[:n]
+-        vals.append(estimate_variance_farima(xb, **estimator_kwargs))
+-
+-    vals = np.array(vals, dtype=float)
+-    lo = float(np.quantile(vals, alpha / 2.0))
+-    hi = float(np.quantile(vals, 1.0 - alpha / 2.0))
++import numpy as np
++from scipy.special import gammaln
++from typing import Optional, Dict, Tuple
++
++
++
++def _acf_arfima0d0(n, d, unit_var=True):
++    """
++    ACF gamma(k), k=0..n, pour ARFIMA(0,d,0), calculée de façon stable via gammaln.
++    Si unit_var=True, renvoie une ACF *normalisée* telle que gamma(0)=1.
++    """
++    k = np.arange(n + 1, dtype=float)
++    # log C(d) = ln Γ(1-2d) - ln Γ(d) - ln Γ(1-d)
++    logC = gammaln(1.0 - 2.0*d) - (gammaln(d) + gammaln(1.0 - d))
++    # ln gamma(k) = logC + ln Γ(k+d) - ln Γ(k+1-d)
++    log_gk = logC + (gammaln(k + d) - gammaln(k + 1.0 - d))
++    g = np.exp(log_gk)
++
++    if unit_var:
++        # gamma(0) = Γ(1-2d)/Γ(1-d)^2  =>  log gamma(0) = logC + ln Γ(d) - ln Γ(1-d)
++        log_g0 = logC + (gammaln(d) - gammaln(1.0 - d))
++        g = np.exp(log_gk - log_g0)  # divise toute l'ACF par gamma(0)
++    return g
++
++def farima_CME(K, H, max_tries=20, tol=1e-12, rng=None):
++    """
++    Génère une fGn (FARIMA(0,d,0) avec d=H-1/2) de longueur K
++    avec *variance unitaire* au lag 0 (normalisation analytique).
++    Implémentation CME robuste (Wood–Chan/Davies–Harte).
++    """
++    if rng is None:
++        rng = np.random.default_rng()
++
++    d = float(H) - 0.5
++    if not (-0.5 < d < 0.5):
++        raise ValueError("H doit être dans (0,1) ⇒ d=H-0.5 dans (-0.5,0.5).")
++    if K < 1:
++        return np.zeros(0, dtype=float)
++
++    # Taille de l'embedding circulant (>= 2*(K-1))
++    p = int(np.ceil(np.log2(2 * (K - 1) if K > 1 else 1)))
++
++    for _ in range(max_tries):
++        m = 2**p
++        n = m // 2
++
++        # --- ACF normalisée : gamma(0)=1 ---
++        g = _acf_arfima0d0(n, d, unit_var=True)
++
++        # vecteur circulant z = [g0, g1, ..., g_{n}, g_{n-1}, ..., g1]
++        z = np.concatenate([g, g[-2:0:-1]])
++        w = np.fft.fft(z).real / m  # valeurs propres (théoriquement ≥0)
++
++        w_max = w.max()
++        eps = tol * (w_max if w_max > 0 else 1.0)
++
++        if w.min() < -eps:
++            # pas assez grand => on augmente l'embedding
++            p += 1
++            continue
++
++        # Rogne de minuscules négatifs dus à l'arrondi
++        w = np.maximum(w, 0.0)
++
++        # Bruit gaussien complexe i.i.d. ~ N(0,1) + i N(0,1)
++        xi = rng.standard_normal(m) + 1j * rng.standard_normal(m)
++        N = np.sqrt(w) * xi
++
++        S = np.fft.fft(N).real  # séquence réelle de covariance z
++        x = S[:int(K)]
++
++        # À ce stade: Var théorique ≈ 1 ; pas de renormalisation empirique
++        return x
++
++    raise RuntimeError("CME n'a pas obtenu un spectre PSD après "
++                       f"{max_tries} tentatives. Augmentez max_tries ou vérifiez 'tol'.")
++
++
++def _apply_taper(x, taper='welch'):
++    """
++    Applique un lissage multiplicatif (taper) pour réduire la fuite spectrale.
++    - 'welch' : w_t = 1 - ((t - (n-1)/2) / ((n+1)/2))^2
++    - None    : pas de taper
++    Retourne x_tapered (centré), et la moyenne soustraite.
++    """
++    x = np.asarray(x, dtype=float)
++    mu = x.mean()
++    y = x - mu
++    n = y.size
++    if taper is None:
++        return y, mu
++    if taper == 'welch':
++        t = np.arange(n)
++        w = 1.0 - ((t - (n - 1) / 2.0) / ((n + 1) / 2.0))**2
++        return y * w, mu
++    else:
++        raise ValueError("taper inconnu. Utilise 'welch' ou None.")
++
++
++def _periodogram(y):
++    """
++    Périodogramme non normalisé (échelle 2π) aux fréquences de Fourier positives.
++    Retourne (freqs, I) avec freqs = 2π*k/n, k=1..floor(n/2).
++    """
++    n = y.size
++    # FFT non normalisée
++    Y = np.fft.rfft(y)  # fréquences 0..n/2
++    # Retirer la fréquence zéro (k=0)
++    I = (np.abs(Y[1:])**2) / (2.0 * np.pi * n)  # échelle standard en long memory
++    k = np.arange(1, Y.size)                   # indices 1..n/2
++    freqs = 2.0 * np.pi * k / n
++    return freqs, I
++
++
++def estimate_d_local_whittle(x, m=None, taper='welch'):
++    """
++    Estimateur local-Whittle de d (Robinson, 1995) pour FARIMA(0,d,0).
++    Paramètres
++    ---------
++    x : array_like
++        Série temporelle (n échantillons).
++    m : int or None
++        Nombre de fréquences basses utilisées (bande passante). Par défaut m = floor(n^0.8).
++        Doit satisfaire 1 << m << n.
++    taper : {'welch', None}
++        Taper pour limiter la fuite spectrale (recommandé 'welch').
++
++    Retour
++    ------
++    d_hat : float
++        Estimation de d.
++    """
++    x = np.asarray(x, dtype=float)
++    n = x.size
++    if n < 64:
++        raise ValueError("Série trop courte pour l'estimation semi-paramétrique (n >= 64 recommandé).")
++
++    y, _ = _apply_taper(x, taper=taper)
++    w, I = _periodogram(y)  # w in (0, π], I >= 0
++
++    # Choix automatique de m si non fourni
++    if m is None:
++        m = int(np.floor(n**0.8))
++    m = max(5, min(m, I.size // 2))  # borne
++    w_m = w[:m]
++    I_m = I[:m]
++
++    # Fonction objectif Whittle local (profilée en sigma^2)
++    # Q(d) = log( (1/m) sum_{j=1}^m I(w_j) w_j^{2d} ) - (2d/m) * sum log w_j
++    logw = np.log(w_m)
++    Slogw = np.mean(logw)
++
++    def Q_of_d(d):
++        weights = np.exp(2.0 * d * logw)  # w_j^{2d}
++        S = np.mean(I_m * weights)
++        if S <= 0 or not np.isfinite(S):
++            return np.inf
++        return np.log(S) - 2.0 * d * Slogw
++
++    # Recherche 1D sur d dans (-0.49, 0.49)
++    # Grille initiale puis raffinement par golden-section.
++    d_lo, d_hi = -0.49, 0.49
++
++    # Grille grossière pour point de départ
++    grid = np.linspace(d_lo, d_hi, 61)
++    vals = np.array([Q_of_d(d) for d in grid])
++    j0 = np.nanargmin(vals)
++    # Encadrer autour du minimum grossier
++    a = max(d_lo, grid[max(0, j0 - 2)])
++    b = min(d_hi, grid[min(len(grid) - 1, j0 + 2)])
++
++    # Golden section search
++    phi = (1 + 5**0.5) / 2
++    invphi = 1 / phi
++    invphi2 = (1 / phi)**2
++    c = b - (b - a) * invphi
++    d = a + (b - a) * invphi
++    fc = Q_of_d(c)
++    fd = Q_of_d(d)
++    for _ in range(80):
++        if fc > fd:
++            a = c
++            c = d
++            fc = fd
++            d = a + (b - a) * invphi
++            fd = Q_of_d(d)
++        else:
++            b = d
++            d = c
++            fd = fc
++            c = b - (b - a) * invphi
++            fc = Q_of_d(c)
++        if abs(b - a) < 1e-6:
++            break
++
++    d_hat = 0.5 * (a + b)
++    return float(d_hat)
++
++
++def estimate_d_gph(x, m=None, taper='welch'):
++    """
++    Estimateur GPH (Geweke-Porter-Hudak) de d par régression log-périodogramme.
++    Paramètres
++    ---------
++    x : array_like
++        Série temporelle.
++    m : int or None
++        Nombre de fréquences basses à utiliser. Par défaut m = floor(n^0.5).
++    taper : {'welch', None}
++        Taper pour limiter la fuite spectrale.
++
++    Retour
++    ------
++    d_hat : float
++        Estimation de d.
++    """
++    x = np.asarray(x, dtype=float)
++    n = x.size
++    if n < 64:
++        raise ValueError("Série trop courte pour GPH (n >= 64 recommandé).")
++
++    y, _ = _apply_taper(x, taper=taper)
++    w, I = _periodogram(y)
++
++    # Choix m : prise classique m ~ n^0.5 (ou n^0.6)
++    if m is None:
++        m = int(np.floor(n**0.5))
++    m = max(5, min(m, I.size // 2))
++    w_m = w[:m]
++    I_m = I[:m]
++
++    # Régression: log I(w_j) = c - 2d * log(2*sin(w_j/2)) + erreur
++    z = np.log(2.0 * np.sin(w_m / 2.0))
++    y_reg = np.log(I_m)
++
++    X = np.vstack([np.ones_like(z), -2.0 * z]).T  # colonnes: 1, -2*z
++    beta, *_ = np.linalg.lstsq(X, y_reg, rcond=None)
++    # beta = [c_hat, d_hat], mais attention au signe:
++    # y = c + (-2d) z => coefficient sur z = -2 d => d_hat = -(coef_z)/2
++    coef_z = beta[1]
++    d_hat = coef_z
++    return float(d_hat)
++
++
++def estimate_d(x, method='local_whittle', m=None, taper='welch'):
++    """
++    Wrapper générique pour estimer d sur une FARIMA(0,d,0).
++
++    method : {'local_whittle', 'gph'}
++        - 'local_whittle' : robuste, recommandé
++        - 'gph'          : plus simple/rapide
++    m : int or None
++        Bande passante (# fréquences basses). Sinon valeur par défaut raisonnable.
++    taper : {'welch', None}
++        Taper pour limiter la fuite spectrale.
++    """
++    method = method.lower()
++    if method == 'local_whittle':
++        return estimate_d_local_whittle(x, m=m, taper=taper)
++    elif method == 'gph':
++        return estimate_d_gph(x, m=m, taper=taper)
++    else:
++        raise ValueError("method inconnu. Utilise 'local_whittle' ou 'gph'.")
++        
++
++# -*- coding: utf-8 -*-
++"""
++Estimateurs de variance pour une séquence FARIMA(0,d,0)
++Compatibilité : Python 3.9 (pas de '|' dans les annotations)
++"""
++
++
++
++# ----------------------------- Utilitaires ----------------------------- #
++
++def _demean(x: np.ndarray) -> np.ndarray:
++    x = np.asarray(x, dtype=float)
++    return x - np.mean(x)
++
++
++def _taper_welch(n: int) -> np.ndarray:
++    """
++    Fenêtre de Welch (parabole) de longueur n :
++    w_t = 1 - ((t - (n-1)/2) / ((n+1)/2))^2
++    """
++    t = np.arange(n, dtype=float)
++    return 1.0 - ((t - (n - 1) / 2.0) / ((n + 1) / 2.0)) ** 2
++
++
++# ----------------------- Estimateur de variance ------------------------ #
++
++def estimate_variance_farima(
++    x,
++    method: str = "unbiased",
++    centre: bool = True,
++    taper: Optional[str] = None,
++) -> float:
++    """
++    Estime Var[X_t] (lag 0) à partir d'une réalisation x de FARIMA(0,d,0).
++
++    Paramètres
++    ----------
++    x : array_like
++        Réalisation 1D (fGn simulée, par ex. via FARIMA(0,d,0)).
++    method : {'unbiased','tapered','mad'}
++        - 'unbiased' : variance empirique centrée (ddof=1 si centre=True, sinon 0).
++        - 'tapered'  : applique une fenêtre (Welch) puis variance centrée
++                       avec correction d'énergie ⟨w^2⟩.
++        - 'mad'      : estimateur robuste via MAD (≈ variance sous gaussien).
++    centre : bool
++        Centre la série avant calcul (recommandé).
++    taper : {None,'welch'}
++        Taper multiplicatif avant variance (utile si method='tapered').
++
++    Retour
++    ------
++    var_hat : float
++        Estimation de la variance (lag 0).
++    """
++    x = np.asarray(x, dtype=float)
++    n = x.size
++    if n < 2:
++        raise ValueError("Il faut au moins 2 observations pour estimer la variance.")
++
++    if method not in {"unbiased", "tapered", "mad"}:
++        raise ValueError("method doit être 'unbiased', 'tapered' ou 'mad'.")
++
++    if method == "mad":
++        # Estimateur robuste : Var ≈ (MAD / Φ^{-1}(0.75))^2
++        med = np.median(x)
++        mad = np.median(np.abs(x - med))
++        # Φ^{-1}(0.75) ≈ 0.67448975
++        sigma = mad / 0.6744897501960817
++        return float(sigma * sigma)
++
++    # Méthodes basées sur la variance empirique
++    y = x.copy()
++
++    if taper is not None:
++        if taper.lower() == "welch":
++            w = _taper_welch(n)
++            y = y * w
++        else:
++            raise ValueError("taper inconnu. Utilise None ou 'welch'.")
++
++        # Après taper, on recalcule le centrage si demandé
++        if centre:
++            y = y - np.mean(y)
++
++        # Correction d'énergie moyenne du taper pour ne pas biaiser la variance
++        w2_mean = np.mean(w ** 2)
++        ddof = 1 if centre else 0
++        var_raw = np.var(y, ddof=ddof)
++        return float(var_raw / (w2_mean if w2_mean > 0 else 1.0))
++
++    # Sans taper
++    if centre:
++        return float(np.var(y, ddof=1))
++    else:
++        return float(np.var(y, ddof=0))
++
++
++# ----------------- IC via bootstrap en blocs (optionnel) ---------------- #
++
++def variance_ci_block_bootstrap(
++    x,
++    B: int = 500,
++    block_len: Optional[int] = None,
++    alpha: float = 0.05,
++    estimator_kwargs: Optional[Dict] = None,
++    rng: Optional[np.random.Generator] = None,
++) -> Tuple[float, Tuple[float, float]]:
++    """
++    Intervalle de confiance (IC) pour Var[X_t] via bootstrap en blocs (simple).
++    Utile avec dépendance (FARIMA).
++
++    Paramètres
++    ----------
++    x : array_like
++        Réalisation 1D.
++    B : int
++        Nombre de rééchantillonnages bootstrap.
++    block_len : int | None
++        Longueur de bloc (par défaut ~ n^{1/3}).
++    alpha : float
++        Niveau (0.05 => IC à 95%).
++    estimator_kwargs : dict | None
++        Arguments passés à estimate_variance_farima (ex: {'method':'tapered','taper':'welch'}).
++    rng : np.random.Generator | None
++        Générateur aléatoire pour reproductibilité.
++
++    Retour
++    ------
++    (var_hat, (lo, hi))
++        var_hat : estimateur sur x,
++        (lo, hi) : bornes de l'IC par percentiles.
++    """
++    x = np.asarray(x, dtype=float)
++    n = x.size
++    if n < 10:
++        raise ValueError("Série trop courte pour bootstrap (n >= 10).")
++
++    if rng is None:
++        rng = np.random.default_rng(1234)
++    if estimator_kwargs is None:
++        estimator_kwargs = {}
++
++    # Estimation sur l'échantillon d'origine
++    var_hat = estimate_variance_farima(x, **estimator_kwargs)
++
++    # Taille des blocs
++    if block_len is None:
++        block_len = max(5, int(round(n ** (1.0 / 3.0))))
++    block_len = int(block_len)
++    n_blocks = int(np.ceil(n / block_len))
++
++    vals = []
++    for _ in range(B):
++        # indices de départ aléatoires pour blocs non chevauchants
++        starts = rng.integers(0, max(1, n - block_len + 1), size=n_blocks)
++        pieces = [x[s: s + block_len] for s in starts]
++        xb = np.concatenate(pieces)[:n]
++        vals.append(estimate_variance_farima(xb, **estimator_kwargs))
++
++    vals = np.array(vals, dtype=float)
++    lo = float(np.quantile(vals, alpha / 2.0))
++    hi = float(np.quantile(vals, 1.0 - alpha / 2.0))
+     return float(var_hat), (lo, hi)
+\ No newline at end of file
+--- legacy_original/genproductscaling.py	2026-10-28 13:45:14.554739154 +0000
++++ legacy_patched/genproductscaling.py	2026-10-28 13:46:15.108443233 +0000
+@@ -1,131 +1,131 @@
+-import pywt
+-import scipy.integrate as integrate
+-import matplotlib.pyplot as plt
+-import numpy as np
+-
+-
+-# Parameters
+-wavelet_name = 'dmey'  # Discrete Meyer wavelet
+-scale = 10  # Meyer wavelet scale
+-
+-# isolement de la fonction d'échelle
+-wavelet = pywt.Wavelet(wavelet_name)
+-phi, _, x = wavelet.wavefun(level=scale)
+-# mettre 0 au centre de l'intervalle
+-y = x[0:len(x)//2+1]
+-z = y[1:len(y)]
+-w = -z[::-1]
+-t = np.concatenate([w, y])
+-#
+-t0 = t[0]
+-dt = t[1]-t[0]
+-
+-#Compute Fourier transform by numpy's FFT function
+-g = np.fft.fft(phi)
+-#frequency normalization factor is 2*np.pi/dt
+-www = np.fft.fftfreq(phi.size)*2*np.pi/dt
+-
+-#In order to get a discretisation of the continuous Fourier transform
+-#we need to multiply g by a phase factor
+-g*=dt*np.exp(-complex(0,1)*www*t0)/(np.sqrt(2*np.pi))
+-
+-valeurs_uniques, indices_uniques = np.unique(www, return_index=True)
+-xi = www[indices_uniques]
+-fphi = np.real(g[indices_uniques])
+-
+-indices = np.where(np.abs(xi) <= 4 * np.pi / 3)[0]
+-
+-#### fractional scaling function
+-xii = xi[indices]
+-fphii = fphi[indices]
+-n = len(xii)
+-####
+-
+-############################################################# ordre2
+-
+-def genintegrand(p,d1,d2):
+-    intermediate = np.abs(np.sinc(xii / 2 / np.pi)) ** (d1+d2) *  np.abs(fphii) ** 2
+-    return np.exp(1j * xii * (p+(d2-d1)/2)) * intermediate
+-
+-def genintegral2(p,d1,d2):
+-    return np.real(integrate.simps(genintegrand(p,d1,d2), xii))
+-
+-def genintegrals2(h1,h2,elar):
+-    print("Computation of the integrals for the Rosenblatt process")
+-    integralvector=[0]*(elar+1)
+-    for i in range(len(integralvector)):
+-        integralvector[i]=genintegral2(i, h1-0.5,h2-0.5)
+-    print("Integrals done!")
+-    return integralvector
+-
+-
+-
+-############################################################### ordre 3
+-
+-
+-def genfphiz(x, y, p, d2,d3):
+-    a1 = np.sinc(y / 2 / np.pi) 
+-    b1 = np.sign(a1) * (np.abs(a1)) ** d3
+-    a2=np.sinc((x-y) / 2 / np.pi)
+-    b2 = np.sign(a2) * (np.abs(a2)) ** d2
+-    c = np.exp(1j * y * (p+(d3-d2)/2)) * b1*b2
+-    return c
+-
+-def genaux1(zeta):
+-    if np.abs(zeta) > 4 * np.pi / 3:
+-        res = 0
+-    else:
+-        indice = np.where( np.abs( xii - zeta) < 1e-10)[0][0]
+-        res = fphii[indice]
+-    return res
+-
+-
+-def genbxi(x, p, d2,d3):
+-    B = 0
+-    for eta in xii:
+-        a1 = genfphiz(x, eta, p, d2,d3)
+-        a2 = genaux1(eta)
+-        a3 = genaux1(x - eta)
+-        a4 = a1 * a2 * a3
+-        B += a4
+-
+-    return (8 * np.pi / 3 / n) * B
+-
+-
+-
+-def genintegral3(p, q, d1,d2,d3):
+-    A = 0
+-    for xi in xii:
+-        a = np.sinc(xi / 2 / np.pi)
+-        b = np.sign(a) * (np.abs(a)) ** d1
+-        #print("b = ",  b)
+-        c = np.exp(1j * xi * (q+(d2-d1)/2))
+-        #print("c = ",  c)
+-        f = genaux1(xi)
+-        #print("f = ", f)
+-        g = genbxi(xi, p, d2,d3)
+-        #print("g = ",  g)
+-        A += c * b * f * g
+-    return np.real((8 * np.pi / 3 / n) * A)
+-
+-def genintegrals3(hl,h2,h3,elar):
+-
+-    print("Computation of the integrals for the Hermite process of order 3")
+-    integralmatrix=np.zeros((elar+1,elar+1))
+-    for i in range(-(elar+1),elar+1):
+-        for j in range(-(elar+1),elar+1):
+-            integralmatrix[i,j]=genintegral3(i,j, hl-0.5,h2-0.5,h3-0.5)
+-    print("Integrals done!")
+-    
+-    return integralmatrix
+-
+-#################################################################
+-
+-def genintegration(d,h1,h2,h3,elar):
+-    
+-        
+-    if d==2 :
+-        return genintegrals2(h1,h2,elar)
+-    else :
+-        return genintegrals3(h1,h2,h3,elar)
+-
++import pywt
++import scipy.integrate as integrate
++import matplotlib.pyplot as plt
++import numpy as np
++
++
++# Parameters
++wavelet_name = 'dmey'  # Discrete Meyer wavelet
++scale = 10  # Meyer wavelet scale
++
++# isolement de la fonction d'échelle
++wavelet = pywt.Wavelet(wavelet_name)
++phi, _, x = wavelet.wavefun(level=scale)
++# mettre 0 au centre de l'intervalle
++y = x[0:len(x)//2+1]
++z = y[1:len(y)]
++w = -z[::-1]
++t = np.concatenate([w, y])
++#
++t0 = t[0]
++dt = t[1]-t[0]
++
++#Compute Fourier transform by numpy's FFT function
++g = np.fft.fft(phi)
++#frequency normalization factor is 2*np.pi/dt
++www = np.fft.fftfreq(phi.size)*2*np.pi/dt
++
++#In order to get a discretisation of the continuous Fourier transform
++#we need to multiply g by a phase factor
++g*=dt*np.exp(-complex(0,1)*www*t0)/(np.sqrt(2*np.pi))
++
++valeurs_uniques, indices_uniques = np.unique(www, return_index=True)
++xi = www[indices_uniques]
++fphi = np.real(g[indices_uniques])
++
++indices = np.where(np.abs(xi) <= 4 * np.pi / 3)[0]
++
++#### fractional scaling function
++xii = xi[indices]
++fphii = fphi[indices]
++n = len(xii)
++####
++
++############################################################# ordre2
++
++def genintegrand(p,d1,d2):
++    intermediate = np.abs(np.sinc(xii / 2 / np.pi)) ** (d1+d2) *  np.abs(fphii) ** 2
++    return np.exp(1j * xii * (p+(d2-d1)/2)) * intermediate
++
++def genintegral2(p,d1,d2):
++    return np.real(integrate.simpson(genintegrand(p,d1,d2), x=xii))
++
++def genintegrals2(h1,h2,elar):
++    print("Computation of the integrals for the Rosenblatt process")
++    integralvector=[0]*(elar+1)
++    for i in range(len(integralvector)):
++        integralvector[i]=genintegral2(i, h1-0.5,h2-0.5)
++    print("Integrals done!")
++    return integralvector
++
++
++
++############################################################### ordre 3
++
++
++def genfphiz(x, y, p, d2,d3):
++    a1 = np.sinc(y / 2 / np.pi) 
++    b1 = np.sign(a1) * (np.abs(a1)) ** d3
++    a2=np.sinc((x-y) / 2 / np.pi)
++    b2 = np.sign(a2) * (np.abs(a2)) ** d2
++    c = np.exp(1j * y * (p+(d3-d2)/2)) * b1*b2
++    return c
++
++def genaux1(zeta):
++    if np.abs(zeta) > 4 * np.pi / 3:
++        res = 0
++    else:
++        indice = np.where( np.abs( xii - zeta) < 1e-10)[0][0]
++        res = fphii[indice]
++    return res
++
++
++def genbxi(x, p, d2,d3):
++    B = 0
++    for eta in xii:
++        a1 = genfphiz(x, eta, p, d2,d3)
++        a2 = genaux1(eta)
++        a3 = genaux1(x - eta)
++        a4 = a1 * a2 * a3
++        B += a4
++
++    return (8 * np.pi / 3 / n) * B
++
++
++
++def genintegral3(p, q, d1,d2,d3):
++    A = 0
++    for xi in xii:
++        a = np.sinc(xi / 2 / np.pi)
++        b = np.sign(a) * (np.abs(a)) ** d1
++        #print("b = ",  b)
++        c = np.exp(1j * xi * (q+(d2-d1)/2))
++        #print("c = ",  c)
++        f = genaux1(xi)
++        #print("f = ", f)
++        g = genbxi(xi, p, d2,d3)
++        #print("g = ",  g)
++        A += c * b * f * g
++    return np.real((8 * np.pi / 3 / n) * A)
++
++def genintegrals3(hl,h2,h3,elar):
++
++    print("Computation of the integrals for the Hermite process of order 3")
++    integralmatrix=np.zeros((elar+1,elar+1))
++    for i in range(-(elar+1),elar+1):
++        for j in range(-(elar+1),elar+1):
++            integralmatrix[i,j]=genintegral3(i,j, hl-0.5,h2-0.5,h3-0.5)
++    print("Integrals done!")
++    
++    return integralmatrix
++
++#################################################################
++
++def genintegration(d,h1,h2,h3,elar):
++    
++        
++    if d==2 :
++        return genintegrals2(h1,h2,elar)
++    else :
++        return genintegrals3(h1,h2,h3,elar)
++
+--- legacy_original/simulations.py	2026-10-28 13:45:14.554990056 +0000
++++ legacy_patched/simulations.py	2026-10-28 13:46:15.108957047 +0000
+@@ -1,481 +1,481 @@
+-import numpy as np
+-from sigmaJ import *
+-from djk import epaissi
+-from productscaling import *
+-from genproductscaling import *
+-import rpy2.robjects as robjects
+-from zjk import farima2
+-import scipy.special as sc
+-import math
+-import statistics
+-from quadestim import *
+-from farimaexact import *
+-
+-r = robjects.r
+-
+-def ckeckadmissibility(Hmin,Hmax,h1min,h1max,h2min,h2max,h3min,h3max,generalized,n2,n3):
+-    
+-    conclusion=True
+-    
+-    if(generalized==True):
+-        if(h1max<h1min): conclusion=False
+-        if(h2max<h2min): conclusion=False
+-        if(h3max<h3min): conclusion=False
+-        if(h1min<=0.5): conclusion=False
+-        if(h2min<=0.5): conclusion=False
+-        if(h3min<=0.5): conclusion=False
+-        if(h1max>=1): conclusion=False
+-        if(h2max>=1): conclusion=False
+-        if(h3max>=1): conclusion=False
+-        
+-        if(n2>0):
+-            if(h1min+h2min <=1.5): conclusion=False
+-        if(n3>0):
+-            if(h1min+h2min+h3min <=2.5): conclusion=False
+-        
+-    else:
+-        if(Hmax<Hmin): conclusion=False
+-        if(Hmin<=0.5): conclusion=False
+-        if(Hmax>=1): conclusion=False
+-        
+-    return conclusion
+-
+-############################################################
+-############################################################
+-################### STANDARD PROCESSES ####################
+-############################################################
+-############################################################
+-
+-############################################################ 
+-########################    FBM    #########################
+-############################################################ 
+-
+-def Brownian(h1,Ij):
+-    
+-    
+-    print("Generation of the FARIMA ")
+-    ### simuler le farima
+-    #set_seed = 42  # Pour rendre la simulation reproductible
+-    #r('set.seed(42)')
+-    nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
+-    f = farima_CME(nb, h1, 20, 1e-12, None)
+-    f=(f-np.mean(f))
+-    print("FARIMA Done!")
+-   
+-
+-     
+-    
+-    result = [0] * len(Ij)
+-    result[0] = f[Ij[0]]
+-    
+-    for index in range(1, len(Ij)):
+-        result[index] = result[index-1] +f[Ij[index]]
+-     
+-        
+-    result=np.asarray(result)/statistics.stdev(np.diff(result))
+-    result = np.append( [0], result)
+-    
+-    return result
+-
+-############################################################ 
+-######################## ROSENBLATT ########################
+-############################################################ 
+-
+-
+-def Rosenblatt(h1,elar,Ij,integralvector):
+-    
+-    
+-    print("Generation of the FARIMA ")
+-    ### simuler le farima
+-    #set_seed = 42  # Pour rendre la simulation reproductible
+-    #r('set.seed(42)')
+-    nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
+-    f = farima_CME(nb, h1, 20, 1e-12, None)
+-    f=(f-np.mean(f))
+-    print("FARIMA Done!")
+-
+-    
+-    result = [0] * len(Ij)
+-    result[0] = sigmaJ2(f,f, [Ij[0], Ij[0]], h1-0.5,h1-0.5) * integralvector[0]
+-    
+-    for index in range(1, len(Ij)):
+-        element= epaissi(Ij[index],elar,Ij[0])
+-        part= sigmaJ2(f,f, [element[0], element[0]], h1-0.5,h1-0.5) * integralvector[0]
+-        for i in range(1,len(element)):
+-            part=part+2*sigmaJ2(f,f, [element[0], element[i]], h1-0.5,h1-0.5) * integralvector[i]
+-        result[index] = result[index-1] +part
+-     
+-    
+-
+-    
+-    result=np.asarray(result)/statistics.stdev(np.diff(result))
+-    result = np.append( [0], result)
+-    
+-    return result
+-    
+-#############################################################
+-
+-
+-
+-############################################################ 
+-########################## ORDER 3 ########################
+-############################################################ 
+-
+-def Hermite3(h1,elar,Ij,integralmatrix):
+-    
+-    print("Generation of the FARIMA")
+-    ### simuler le farima
+-    #set_seed = 42  # Pour rendre la simulation reproductible
+-    #r('set.seed(42)')
+-    nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
+-    f = farima_CME(nb, h1, 20, 1e-12, None)
+-    f=(f-np.mean(f))
+-    print("FARIMA Done!")
+-    
+-    
+-
+-    
+-    
+-    result = [0] * len(Ij)
+-    result[0] = sigmaJ3(f,f,f, [Ij[0], Ij[0],Ij[0]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[0,0]
+-    for index in range(1, len(Ij)):
+-        element= epaissi(Ij[index],elar,Ij[0])
+-        part= sigmaJ3(f,f,f, [element[0], element[0],element[0]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[0,0]
+-        for i in range(1,len(element)):
+-            part=part+3*sigmaJ3(f,f,f,  [element[0], element[0],element[i]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[0,i] 
+-            part=part+3*sigmaJ3(f,f,f, [element[0], element[i],element[i]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[i,0]
+-      
+-            for j in range(i+1,len(element)):
+-                part=part+6*sigmaJ3(f,f,f,  [element[0], element[i],element[j]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[i,j-i]
+-        result[index] = result[index-1] +part
+-    
+-
+-    
+-    result=np.asarray(result)/statistics.stdev(np.diff(result))
+-    result = np.append( [0], result)
+-   
+-   
+-    return result
+-
+-
+-
+-############################################################
+-############################################################
+-################### GENERALIZED PROCESSES ##################
+-############################################################
+-############################################################
+-
+-############################################################ 
+-########################## ORDER 2 ########################
+-############################################################ 
+-
+-def GenRosenblatt(h1,h2,elar,Ij,integralvector):
+-    
+-   
+-    if(h1==h2): return Rosenblatt(h1,elar,Ij,integralvector)
+-    #converting to a standard Rosenblatt process to save computation time
+-    
+-    else:
+-        print("Generation of the FARIMAS")
+-        ### simuler le farima
+-        #set_seed = 42  # Pour rendre la simulation reproductible
+-        #r('set.seed(42)')
+-        nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
+-        f1 = farima_CME(nb, h1, 20, 1e-12, None)
+-        f2 = farima_CME(nb, h2, 20, 1e-12, None)
+-        print("FARIMAS Done!")
+-
+-        result = [0] * len(Ij)
+-        result[0] = sigmaJ2(f1,f2, [Ij[0], Ij[0]], h1-0.5,h2-0.5) * integralvector[0]
+-        for index in range(1, len(Ij)):
+-            
+-            element= epaissi(Ij[index],elar,Ij[0])
+-            part=sigmaJ2(f1,f2, [element[0], element[0]], h1-0.5,h2-0.5)  * integralvector[0]
+-            for i in range(1,len(element)):
+-                part=part+sigmaJ2(f1,f2, [element[0], element[0],element[i]], h1-0.5,h2-0.5)  * integralvector[i]
+-                part=part+sigmaJ2(f1,f2, [element[0], element[i],element[0]], h1-0.5,h2-0.5)  * integralvector[-i]
+-                          
+-                
+-            result[index] = result[index-1] +part
+-        
+-        
+-        
+-        result = np.append( [0], result)
+-       
+-       
+-        return result
+-    
+-    
+-
+-
+-
+-############################################################ 
+-########################## ORDER 3 ########################
+-############################################################ 
+-
+-def GenHermite3(h1,h2,h3,elar,Ij,integralmatrix):
+-    
+-    if(h1==h2 and h2==h3): return Hermite3(h1,elar,Ij,integralmatrix)
+-    #converting to a standard Hermite process to save computation time
+-    
+-    else:
+-        
+-        print("Generation of the FARIMAS")
+-        ### simuler le farima
+-        #set_seed = 42  # Pour rendre la simulation reproductible
+-        #r('set.seed(42)')
+-        nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
+-        f1 = farima_CME(nb, h1, 20, 1e-12, None)
+-        f2 = farima_CME(nb, h2, 20, 1e-12, None)
+-        f3 = farima_CME(nb, h3, 20, 1e-12, None)
+-        print("FARIMAS Done!")
+-
+-        result = [0] * len(Ij)
+-        result[0] = sigmaJ3(f1,f2,f3, [Ij[0], Ij[0],Ij[0]], h1-0.5,h2-0.5,h3-0.5) * integralmatrix[0,0]
+-        
+-        for index in range(1, len(Ij)):
+-            element= epaissi(Ij[index],elar,Ij[0])
+-            part=sigmaJ3(f1,f2,f3, [element[0], element[0],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[0,0]
+-            for i in range(1,len(element)):
+-                part=part+sigmaJ3(f1,f2,f3, [element[0], element[0],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[0,-i]
+-                part=part+sigmaJ3(f1,f2,f3, [element[0], element[i],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-i,i]
+-                part=part+sigmaJ3(f1,f2,f3, [element[i], element[0],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i,0]
+-                part=part+sigmaJ3(f1,f2,f3, [element[0], element[i],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-i,0]
+-                part=part+sigmaJ3(f1,f2,f3, [element[i], element[0],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i,-i]
+-                part=part+sigmaJ3(f1,f2,f3, [element[i], element[i],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[0,i]
+-                for j in range(1,len(element)):
+-                    if(j!=i):
+-                        part=part+sigmaJ3(f1,f2,f3, [element[0], element[i],element[j]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-i,i-j]
+-                        part=part+sigmaJ3(f1,f2,f3, [element[0], element[j],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-j,j-i]
+-                        part=part+sigmaJ3(f1,f2,f3, [element[i], element[0],element[j]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i,-j]
+-                        part=part+sigmaJ3(f1,f2,f3, [element[j], element[0],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[j,-i]
+-                        part=part+sigmaJ3(f1,f2,f3, [element[i], element[j],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i-j,j]
+-                        part=part+sigmaJ3(f1,f2,f3, [element[j], element[i],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[j-i,i]
+-                
+-            result[index] = result[index-1] +part
+-        
+-        
+-        
+-        result = np.append( [0], result)
+-       
+-       
+-        return result
+-    
+-   
+-
+-
+-############################################################# 
+-
+-############################################################ 
+-#################### ADDITIONAL FUNCTIONS ##################
+-############################################################ 
+-
+-
+-
+-def standard(n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step):
+-    
+-    simu=np.zeros(((n1+n2+n3)*step,len(time)+1))
+-    
+-    for j in range(step):
+-        if(step>1):H=Hmin+j*(Hmax-Hmin)/(step-1)
+-        else:H=Hmin
+-        
+-        if(n1>0):
+-            print(f"-----------------------Simulation(s) of the Fractional Brownian motion with Hurst parameter {H:.2f}-----------------------")
+-        
+-            for i in range(n1):
+-                print(f"Simulation of the path {i+1:.0f} over {n1:.0f}")
+-                simu[(n1+n2+n3)*j+i]= 2 ** (- J * H) *np.array(Brownian(H,Ij))
+-                print(f"Simulation of the path {i+1:.0f} over {n1:.0f} completed")
+-        
+-            
+-
+-        if(n2>0):
+-            print(f"-----------------------Simulation(s) of the Rosenblatt process with Hurst parameter {H:.2f}-----------------------")
+-            ############## first computation of the integrals
+-            integral2=integration(2,H,elar)
+-        
+-        
+-            for i in range(n2):
+-                print(f"Simulation of the path {i+1:.0f} over {n2:.0f}")
+-                simu[(n1+n2+n3)*j+n1+i]= 2 ** (- J * H) *np.array(Rosenblatt(1+((H-1)/2),elar,Ij,integral2))
+-                print(f"Simulation of the path {i+1:.0f} over {n2:.0f} completed")
+-            
+-            
+-
+-        if(n3>0):
+-            print(f"-----------------------Simulation(s) of the Hermite process of order 3 with Hurst parameter {H:.2f}-----------------------")
+-            
+-            integral3=integration(3,H,elar)
+-                
+-            for i in range(n3):
+-                print(f"Simulation of the path {i+1:.0f} over {n3:.0f} ")
+-                simu[(n1+n2+n3)*j+n1+n2+i]= 2 ** (- J *H) *np.array(Hermite3(1+((H-1)/3),elar,Ij,integral3))
+-                print(f"Simulation of the path {i+1:.0f} over {n3:.0f} completed")
+-           
+-            
+-           
+-        
+-    return simu 
+-
+-
+-def testedstandard(binf,n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step):
+-    
+-    simu=np.zeros(((n1+n2+n3)*step,len(time)+1))
+-    
+-    for j in range(step):
+-        if(step>1):H=Hmin+j*(Hmax-Hmin)/(step-1)
+-        else:H=Hmin
+-        
+-        if(n1>0):
+-            print(f"-----------------------Simulation(s) of the Fractional Brownian motion with Hurst parameter {H:.2f}-----------------------")
+-            loc=0
+-            for i in range(2**n1):
+-                print(f"Simulation of the path {loc+1:.0f} over {n1:.0f}")
+-                print(f"Simulation number is {i+1:.0f} ")
+-                simulation=2 ** (- J * H) *np.array(Brownian(H,Ij))
+-                Hestim=HurstQuadEstim(binf,simulation,J,0.51,J-3,0.72,0.75)
+-                print(Hestim)
+-                if(Hestim<H-0.015 or Hestim>H+0.015):
+-                    print("FAILED")
+-                else:
+-                    simu[(n1+n2+n3)*j+loc]=simulation
+-                    print(f"Simulation of the path {loc+1:.0f} over {n1:.0f} completed")
+-                    loc=loc+1
+-                    if(loc==n1): break                
+-                
+-                
+-             
+-        
+-            
+-
+-        if(n2>0):
+-            print(f"-----------------------Simulation(s) of the Rosenblatt process with Hurst parameter {H:.2f}-----------------------")
+-            ############## first computation of the integrals
+-            integral2=integration(2,H,elar)
+-        
+-            loc=0
+-            for i in range(2**n2):
+-                print(f"Simulation of the path {loc+1:.0f} over {n2:.0f}")
+-                print(f"Simulation number is {i+1:.0f} ")
+-                simulation=2 ** (- J * H) *np.array(Rosenblatt(1+((H-1)/2),elar,Ij,integral2))
+-                Hestim=HurstQuadEstim(binf,simulation,J,0.51,J-3,0.72,0.75)
+-                print(Hestim)
+-                if(Hestim<H-0.015 or Hestim>H+0.015):
+-                    print("FAILED")
+-                else:
+-                    simu[(n1+n2+n3)*j+n1+loc]=simulation
+-                    print(f"Simulation of the path {loc+1:.0f} over {n2:.0f} completed")
+-                    loc=loc+1
+-                    if(loc==n2): break  
+-            
+-            
+-
+-        if(n3>0):
+-            print(f"-----------------------Simulation(s) of the Hermite process of order 3 with Hurst parameter {H:.2f}-----------------------")
+-            
+-            integral3=integration(3,H,elar)
+-            loc=0    
+-            for i in range(2**n3):
+-                print(f"Simulation of the path {loc+1:.0f} over {n3:.0f} ")
+-                print(f"Simulation number is {i+1:.0f} ")
+-                simulation=2 ** (- J *H) *np.array(Hermite3(1+((H-1)/3),elar,Ij,integral3))
+-                Hestim=HurstQuadEstim(binf,simulation,J,0.51,J-3,0.72,0.75)
+-                print(Hestim)
+-                if(Hestim<H-0.015 or Hestim>H+0.015):
+-                    print("FAILED")
+-                else:
+-                    simu[(n1+n2+n3)*j+n1+n2+loc]=simulation 
+-                    print(f"Simulation of the path {loc+1:.0f} over {n3:.0f} completed")
+-                    loc=loc+1
+-                    if(loc==n3): break  
+-                
+-           
+-            
+-           
+-        
+-    return simu 
+-
+-
+-def Standardsimulations(control,binf,n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step):
+-    
+-    if(control==False):
+-        return standard(n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step)
+-    
+-    else:
+-        return testedstandard(binf,n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step)
+-
+-############################### SPLITER #######################################
+-# take a matrix of simulations and select the ones at ranges betwwen a and b #
+-##############################################################################
+-
+-def simulspliter(simu,a,b,time):
+-    select=np.zeros((b-a+1,len(time)+1))
+-    for i in range (b-a+1):
+-        select[i]=simu[a+i]
+-    
+-    return select
+-###############################INCREMENTS######################################
+-# return a table whose elements are the increments of a simulated process######
+-###############################################################################
+-
+-def increments(simu,first):
+-    if(first==False):i=2
+-    else:i=1
+-        
+-    table=np.zeros((len(simu)-i))
+-    
+-    for k in range(len(table)):
+-        table[k]=simu[k+i]-simu[k+i-1]
+-  
+-    return table
+-
+-
+-def generalizedsim(n1,n2,n3,h1min,h1max,h2min,h2max,h3min,h3max,J,Ij,elar,time,step1,step2,step3):
+-    
+-    simu=np.zeros((n1*step1+n2*(step1*step2)+n3*(step1*step2*step3),len(time)+1))
+-    
+-    for j1 in range(step1):
+-        if(step1>1):h1=h1min+j1*(h1max-h1min)/(step1-1)
+-        else:h1=h1min            
+-        
+-        if(n1>0):
+-            print(f"-----------------------Simulation(s) of the Fractional Brownian motion with parameters {h1:.2f}-----------------------")
+-        
+-            for i in range(n1):
+-                print(f"Simulation of the path {i+1:.0f} over {n1:.0f}")
+-                simu[j1*(n1+n2*step2+n3*step2*step3)+i]= 2 ** (- J * h1) *np.array(Brownian(h1,Ij))
+-                print(f"Simulation of the path {i+1:.0f} over {n1:.0f} completed")
+-        
+-        for j2 in range(step2):
+-            if(step2>1):h2=h2min+j2*(h2max-h2min)/(step2-1)
+-            else:h2=h2min
+-            
+-            if(n2>0):
+-                print(f"-----------------------Simulation(s) of the generalized Rosenblatt process with Hurst parameters {h1:.2f} and {h2:.2f} -----------------------")
+-                ############## first computation of the integrals
+-                integral2=genintegration(2,h1,h2,h3min,elar)
+-            
+-            
+-                for i in range(n2):
+-                    print(f"Simulation of the path {i+1:.0f} over {n2:.0f}")
+-                    simu[j1*(n1+n2*step2+n3*step2*step3)+n1+j2*(n2+n3*step3)+i]= 2 ** (- J * (h1+h2-1)) *np.array(GenRosenblatt(h1,h2,elar,Ij,integral2))
+-                    print(f"Simulation of the path {i+1:.0f} over {n2:.0f} completed")
+-            
+-            
+-            for j3 in range(step3):
+-                if(step3>1):h3=h3min+j3*(h3max-h3min)/(step3-1)
+-                else:h3=h3min
+-                
+-                if(n3>0):
+-                    print(f"-----------------------Simulation(s) of the generalized Hermite process of order 3 with Hurst parameters {h1:.2f}, {h2:.2f} and {h3:.2f}-----------------------")
+-                    
+-                    integral3=genintegration(3,h1,h2,h3,elar)
+-                        
+-                    for i in range(n3):
+-                        print(f"Simulation of the path {i+1:.0f} over {n3:.0f} ")
+-                        simu[j1*(n1+n2*step2+n3*step2*step3)+n1+j2*(n2+n3*step3)+n2+j3*n3+i]= 2 ** (- J *(h1+h2+h3-2)) *np.array(GenHermite3(h1,h2,h3,elar,Ij,integral3))
+-                        print(f"Simulation of the path {i+1:.0f} over {n3:.0f} completed")
+-      
+-        
+-    return simu 
+\ No newline at end of file
++import numpy as np
++from sigmaJ import *
++from djk import epaissi
++from productscaling import *
++from genproductscaling import *
++import rpy2.robjects as robjects
++from zjk import farima2
++import scipy.special as sc
++import math
++import statistics
++from quadestim import *
++from farimaexact import *
++
++r = robjects.r
++
++def ckeckadmissibility(Hmin,Hmax,h1min,h1max,h2min,h2max,h3min,h3max,generalized,n2,n3):
++    
++    conclusion=True
++    
++    if(generalized==True):
++        if(h1max<h1min): conclusion=False
++        if(h2max<h2min): conclusion=False
++        if(h3max<h3min): conclusion=False
++        if(h1min<=0.5): conclusion=False
++        if(h2min<=0.5): conclusion=False
++        if(h3min<=0.5): conclusion=False
++        if(h1max>=1): conclusion=False
++        if(h2max>=1): conclusion=False
++        if(h3max>=1): conclusion=False
++        
++        if(n2>0):
++            if(h1min+h2min <=1.5): conclusion=False
++        if(n3>0):
++            if(h1min+h2min+h3min <=2.5): conclusion=False
++        
++    else:
++        if(Hmax<Hmin): conclusion=False
++        if(Hmin<=0.5): conclusion=False
++        if(Hmax>=1): conclusion=False
++        
++    return conclusion
++
++############################################################
++############################################################
++################### STANDARD PROCESSES ####################
++############################################################
++############################################################
++
++############################################################ 
++########################    FBM    #########################
++############################################################ 
++
++def Brownian(h1,Ij):
++    
++    
++    print("Generation of the FARIMA ")
++    ### simuler le farima
++    #set_seed = 42  # Pour rendre la simulation reproductible
++    #r('set.seed(42)')
++    nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
++    f = farima_CME(nb, h1, 20, 1e-12, None)
++    f=(f-np.mean(f))
++    print("FARIMA Done!")
++   
++
++     
++    
++    result = [0] * len(Ij)
++    result[0] = f[Ij[0]]
++    
++    for index in range(1, len(Ij)):
++        result[index] = result[index-1] +f[Ij[index]]
++     
++        
++    result=np.asarray(result)/statistics.stdev(np.diff(result))
++    result = np.append( [0], result)
++    
++    return result
++
++############################################################ 
++######################## ROSENBLATT ########################
++############################################################ 
++
++
++def Rosenblatt(h1,elar,Ij,integralvector):
++    
++    
++    print("Generation of the FARIMA ")
++    ### simuler le farima
++    #set_seed = 42  # Pour rendre la simulation reproductible
++    #r('set.seed(42)')
++    nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
++    f = farima_CME(nb, h1, 20, 1e-12, None)
++    f=(f-np.mean(f))
++    print("FARIMA Done!")
++
++    
++    result = [0] * len(Ij)
++    result[0] = sigmaJ2(f,f, [Ij[0], Ij[0]], h1-0.5,h1-0.5) * integralvector[0]
++    
++    for index in range(1, len(Ij)):
++        element= epaissi(Ij[index],elar,Ij[0])
++        part= sigmaJ2(f,f, [element[0], element[0]], h1-0.5,h1-0.5) * integralvector[0]
++        for i in range(1,len(element)):
++            part=part+2*sigmaJ2(f,f, [element[0], element[i]], h1-0.5,h1-0.5) * integralvector[i]
++        result[index] = result[index-1] +part
++     
++    
++
++    
++    result=np.asarray(result)/statistics.stdev(np.diff(result))
++    result = np.append( [0], result)
++    
++    return result
++    
++#############################################################
++
++
++
++############################################################ 
++########################## ORDER 3 ########################
++############################################################ 
++
++def Hermite3(h1,elar,Ij,integralmatrix):
++    
++    print("Generation of the FARIMA")
++    ### simuler le farima
++    #set_seed = 42  # Pour rendre la simulation reproductible
++    #r('set.seed(42)')
++    nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
++    f = farima_CME(nb, h1, 20, 1e-12, None)
++    f=(f-np.mean(f))
++    print("FARIMA Done!")
++    
++    
++
++    
++    
++    result = [0] * len(Ij)
++    result[0] = sigmaJ3(f,f,f, [Ij[0], Ij[0],Ij[0]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[0,0]
++    for index in range(1, len(Ij)):
++        element= epaissi(Ij[index],elar,Ij[0])
++        part= sigmaJ3(f,f,f, [element[0], element[0],element[0]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[0,0]
++        for i in range(1,len(element)):
++            part=part+3*sigmaJ3(f,f,f,  [element[0], element[0],element[i]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[0,i] 
++            part=part+3*sigmaJ3(f,f,f, [element[0], element[i],element[i]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[i,0]
++      
++            for j in range(i+1,len(element)):
++                part=part+6*sigmaJ3(f,f,f,  [element[0], element[i],element[j]], h1-0.5,h1-0.5,h1-0.5) * integralmatrix[i,j-i]
++        result[index] = result[index-1] +part
++    
++
++    
++    result=np.asarray(result)/statistics.stdev(np.diff(result))
++    result = np.append( [0], result)
++   
++   
++    return result
++
++
++
++############################################################
++############################################################
++################### GENERALIZED PROCESSES ##################
++############################################################
++############################################################
++
++############################################################ 
++########################## ORDER 2 ########################
++############################################################ 
++
++def GenRosenblatt(h1,h2,elar,Ij,integralvector):
++    
++   
++    if(h1==h2): return Rosenblatt(h1,elar,Ij,integralvector)
++    #converting to a standard Rosenblatt process to save computation time
++    
++    else:
++        print("Generation of the FARIMAS")
++        ### simuler le farima
++        #set_seed = 42  # Pour rendre la simulation reproductible
++        #r('set.seed(42)')
++        nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
++        f1 = farima_CME(nb, h1, 20, 1e-12, None)
++        f2 = farima_CME(nb, h2, 20, 1e-12, None)
++        print("FARIMAS Done!")
++
++        result = [0] * len(Ij)
++        result[0] = sigmaJ2(f1,f2, [Ij[0], Ij[0]], h1-0.5,h2-0.5) * integralvector[0]
++        for index in range(1, len(Ij)):
++            
++            element= epaissi(Ij[index],elar,Ij[0])
++            part=sigmaJ2(f1,f2, [element[0], element[0]], h1-0.5,h2-0.5)  * integralvector[0]
++            for i in range(1,len(element)):
++                part=part+sigmaJ2(f1,f2, [element[0], element[i]], h1-0.5,h2-0.5)  * integralvector[i]
++                part=part+sigmaJ2(f1,f2, [element[i], element[0]], h1-0.5,h2-0.5)  * integralvector[-i]
++                          
++                
++            result[index] = result[index-1] +part
++        
++        
++        
++        result = np.append( [0], result)
++       
++       
++        return result
++    
++    
++
++
++
++############################################################ 
++########################## ORDER 3 ########################
++############################################################ 
++
++def GenHermite3(h1,h2,h3,elar,Ij,integralmatrix):
++    
++    if(h1==h2 and h2==h3): return Hermite3(h1,elar,Ij,integralmatrix)
++    #converting to a standard Hermite process to save computation time
++    
++    else:
++        
++        print("Generation of the FARIMAS")
++        ### simuler le farima
++        #set_seed = 42  # Pour rendre la simulation reproductible
++        #r('set.seed(42)')
++        nb = 2 ** (np.ceil(np.log2(Ij[-1]))) ## pour le nombre de terme pour simuler farima
++        f1 = farima_CME(nb, h1, 20, 1e-12, None)
++        f2 = farima_CME(nb, h2, 20, 1e-12, None)
++        f3 = farima_CME(nb, h3, 20, 1e-12, None)
++        print("FARIMAS Done!")
++
++        result = [0] * len(Ij)
++        result[0] = sigmaJ3(f1,f2,f3, [Ij[0], Ij[0],Ij[0]], h1-0.5,h2-0.5,h3-0.5) * integralmatrix[0,0]
++        
++        for index in range(1, len(Ij)):
++            element= epaissi(Ij[index],elar,Ij[0])
++            part=sigmaJ3(f1,f2,f3, [element[0], element[0],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[0,0]
++            for i in range(1,len(element)):
++                part=part+sigmaJ3(f1,f2,f3, [element[0], element[0],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[0,-i]
++                part=part+sigmaJ3(f1,f2,f3, [element[0], element[i],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-i,i]
++                part=part+sigmaJ3(f1,f2,f3, [element[i], element[0],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i,0]
++                part=part+sigmaJ3(f1,f2,f3, [element[0], element[i],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-i,0]
++                part=part+sigmaJ3(f1,f2,f3, [element[i], element[0],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i,-i]
++                part=part+sigmaJ3(f1,f2,f3, [element[i], element[i],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[0,i]
++                for j in range(1,len(element)):
++                    if(j!=i):
++                        part=part+sigmaJ3(f1,f2,f3, [element[0], element[i],element[j]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-i,i-j]
++                        part=part+sigmaJ3(f1,f2,f3, [element[0], element[j],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[-j,j-i]
++                        part=part+sigmaJ3(f1,f2,f3, [element[i], element[0],element[j]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i,-j]
++                        part=part+sigmaJ3(f1,f2,f3, [element[j], element[0],element[i]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[j,-i]
++                        part=part+sigmaJ3(f1,f2,f3, [element[i], element[j],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[i-j,j]
++                        part=part+sigmaJ3(f1,f2,f3, [element[j], element[i],element[0]], h1-0.5,h2-0.5,h3-0.5)  * integralmatrix[j-i,i]
++                
++            result[index] = result[index-1] +part
++        
++        
++        
++        result = np.append( [0], result)
++       
++       
++        return result
++    
++   
++
++
++############################################################# 
++
++############################################################ 
++#################### ADDITIONAL FUNCTIONS ##################
++############################################################ 
++
++
++
++def standard(n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step):
++    
++    simu=np.zeros(((n1+n2+n3)*step,len(time)+1))
++    
++    for j in range(step):
++        if(step>1):H=Hmin+j*(Hmax-Hmin)/(step-1)
++        else:H=Hmin
++        
++        if(n1>0):
++            print(f"-----------------------Simulation(s) of the Fractional Brownian motion with Hurst parameter {H:.2f}-----------------------")
++        
++            for i in range(n1):
++                print(f"Simulation of the path {i+1:.0f} over {n1:.0f}")
++                simu[(n1+n2+n3)*j+i]= 2 ** (- J * H) *np.array(Brownian(H,Ij))
++                print(f"Simulation of the path {i+1:.0f} over {n1:.0f} completed")
++        
++            
++
++        if(n2>0):
++            print(f"-----------------------Simulation(s) of the Rosenblatt process with Hurst parameter {H:.2f}-----------------------")
++            ############## first computation of the integrals
++            integral2=integration(2,H,elar)
++        
++        
++            for i in range(n2):
++                print(f"Simulation of the path {i+1:.0f} over {n2:.0f}")
++                simu[(n1+n2+n3)*j+n1+i]= 2 ** (- J * H) *np.array(Rosenblatt(1+((H-1)/2),elar,Ij,integral2))
++                print(f"Simulation of the path {i+1:.0f} over {n2:.0f} completed")
++            
++            
++
++        if(n3>0):
++            print(f"-----------------------Simulation(s) of the Hermite process of order 3 with Hurst parameter {H:.2f}-----------------------")
++            
++            integral3=integration(3,H,elar)
++                
++            for i in range(n3):
++                print(f"Simulation of the path {i+1:.0f} over {n3:.0f} ")
++                simu[(n1+n2+n3)*j+n1+n2+i]= 2 ** (- J *H) *np.array(Hermite3(1+((H-1)/3),elar,Ij,integral3))
++                print(f"Simulation of the path {i+1:.0f} over {n3:.0f} completed")
++           
++            
++           
++        
++    return simu 
++
++
++def testedstandard(binf,n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step):
++    
++    simu=np.zeros(((n1+n2+n3)*step,len(time)+1))
++    
++    for j in range(step):
++        if(step>1):H=Hmin+j*(Hmax-Hmin)/(step-1)
++        else:H=Hmin
++        
++        if(n1>0):
++            print(f"-----------------------Simulation(s) of the Fractional Brownian motion with Hurst parameter {H:.2f}-----------------------")
++            loc=0
++            for i in range(2**n1):
++                print(f"Simulation of the path {loc+1:.0f} over {n1:.0f}")
++                print(f"Simulation number is {i+1:.0f} ")
++                simulation=2 ** (- J * H) *np.array(Brownian(H,Ij))
++                Hestim=HurstQuadEstim(binf,simulation,J,0.51,J-3,0.72,0.75)
++                print(Hestim)
++                if(Hestim<H-0.015 or Hestim>H+0.015):
++                    print("FAILED")
++                else:
++                    simu[(n1+n2+n3)*j+loc]=simulation
++                    print(f"Simulation of the path {loc+1:.0f} over {n1:.0f} completed")
++                    loc=loc+1
++                    if(loc==n1): break                
++                
++                
++             
++        
++            
++
++        if(n2>0):
++            print(f"-----------------------Simulation(s) of the Rosenblatt process with Hurst parameter {H:.2f}-----------------------")
++            ############## first computation of the integrals
++            integral2=integration(2,H,elar)
++        
++            loc=0
++            for i in range(2**n2):
++                print(f"Simulation of the path {loc+1:.0f} over {n2:.0f}")
++                print(f"Simulation number is {i+1:.0f} ")
++                simulation=2 ** (- J * H) *np.array(Rosenblatt(1+((H-1)/2),elar,Ij,integral2))
++                Hestim=HurstQuadEstim(binf,simulation,J,0.51,J-3,0.72,0.75)
++                print(Hestim)
++                if(Hestim<H-0.015 or Hestim>H+0.015):
++                    print("FAILED")
++                else:
++                    simu[(n1+n2+n3)*j+n1+loc]=simulation
++                    print(f"Simulation of the path {loc+1:.0f} over {n2:.0f} completed")
++                    loc=loc+1
++                    if(loc==n2): break  
++            
++            
++
++        if(n3>0):
++            print(f"-----------------------Simulation(s) of the Hermite process of order 3 with Hurst parameter {H:.2f}-----------------------")
++            
++            integral3=integration(3,H,elar)
++            loc=0    
++            for i in range(2**n3):
++                print(f"Simulation of the path {loc+1:.0f} over {n3:.0f} ")
++                print(f"Simulation number is {i+1:.0f} ")
++                simulation=2 ** (- J *H) *np.array(Hermite3(1+((H-1)/3),elar,Ij,integral3))
++                Hestim=HurstQuadEstim(binf,simulation,J,0.51,J-3,0.72,0.75)
++                print(Hestim)
++                if(Hestim<H-0.015 or Hestim>H+0.015):
++                    print("FAILED")
++                else:
++                    simu[(n1+n2+n3)*j+n1+n2+loc]=simulation 
++                    print(f"Simulation of the path {loc+1:.0f} over {n3:.0f} completed")
++                    loc=loc+1
++                    if(loc==n3): break  
++                
++           
++            
++           
++        
++    return simu 
++
++
++def Standardsimulations(control,binf,n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step):
++    
++    if(control==False):
++        return standard(n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step)
++    
++    else:
++        return testedstandard(binf,n1,n2,n3,Hmin,Hmax,J,Ij,elar,time,step)
++
++############################### SPLITER #######################################
++# take a matrix of simulations and select the ones at ranges betwwen a and b #
++##############################################################################
++
++def simulspliter(simu,a,b,time):
++    select=np.zeros((b-a+1,len(time)+1))
++    for i in range (b-a+1):
++        select[i]=simu[a+i]
++    
++    return select
++###############################INCREMENTS######################################
++# return a table whose elements are the increments of a simulated process######
++###############################################################################
++
++def increments(simu,first):
++    if(first==False):i=2
++    else:i=1
++        
++    table=np.zeros((len(simu)-i))
++    
++    for k in range(len(table)):
++        table[k]=simu[k+i]-simu[k+i-1]
++  
++    return table
++
++
++def generalizedsim(n1,n2,n3,h1min,h1max,h2min,h2max,h3min,h3max,J,Ij,elar,time,step1,step2,step3):
++    
++    simu=np.zeros((n1*step1+n2*(step1*step2)+n3*(step1*step2*step3),len(time)+1))
++    
++    for j1 in range(step1):
++        if(step1>1):h1=h1min+j1*(h1max-h1min)/(step1-1)
++        else:h1=h1min            
++        
++        if(n1>0):
++            print(f"-----------------------Simulation(s) of the Fractional Brownian motion with parameters {h1:.2f}-----------------------")
++        
++            for i in range(n1):
++                print(f"Simulation of the path {i+1:.0f} over {n1:.0f}")
++                simu[j1*(n1+n2*step2+n3*step2*step3)+i]= 2 ** (- J * h1) *np.array(Brownian(h1,Ij))
++                print(f"Simulation of the path {i+1:.0f} over {n1:.0f} completed")
++        
++        for j2 in range(step2):
++            if(step2>1):h2=h2min+j2*(h2max-h2min)/(step2-1)
++            else:h2=h2min
++            
++            if(n2>0):
++                print(f"-----------------------Simulation(s) of the generalized Rosenblatt process with Hurst parameters {h1:.2f} and {h2:.2f} -----------------------")
++                ############## first computation of the integrals
++                integral2=genintegration(2,h1,h2,h3min,elar)
++            
++            
++                for i in range(n2):
++                    print(f"Simulation of the path {i+1:.0f} over {n2:.0f}")
++                    simu[j1*(n1+n2*step2+n3*step2*step3)+n1+j2*(n2+n3*step3)+i]= 2 ** (- J * (h1+h2-1)) *np.array(GenRosenblatt(h1,h2,elar,Ij,integral2))
++                    print(f"Simulation of the path {i+1:.0f} over {n2:.0f} completed")
++            
++            
++            for j3 in range(step3):
++                if(step3>1):h3=h3min+j3*(h3max-h3min)/(step3-1)
++                else:h3=h3min
++                
++                if(n3>0):
++                    print(f"-----------------------Simulation(s) of the generalized Hermite process of order 3 with Hurst parameters {h1:.2f}, {h2:.2f} and {h3:.2f}-----------------------")
++                    
++                    integral3=genintegration(3,h1,h2,h3,elar)
++                        
++                    for i in range(n3):
++                        print(f"Simulation of the path {i+1:.0f} over {n3:.0f} ")
++                        simu[j1*(n1+n2*step2+n3*step2*step3)+n1+j2*(n2+n3*step3)+n2+j3*n3+i]= 2 ** (- J *(h1+h2+h3-2)) *np.array(GenHermite3(h1,h2,h3,elar,Ij,integral3))
++                        print(f"Simulation of the path {i+1:.0f} over {n3:.0f} completed")
++      
++        
++    return simu 
